@@ -216,48 +216,81 @@ class SpectralFileReader:
     @staticmethod
     def _read_spc(file_path: str) -> SpectralData:
         """Read SPC format files (Galactic/Thermo format)."""
-        # Try spectrochempy first
+        # Prefer spectrochempy for robust SPC parsing
         if SCP_AVAILABLE:
             try:
-                # Load SPC file using spectrochempy
-                dataset = scp.read(file_path)
-                
-                # Extract wavelengths and intensities
-                if hasattr(dataset, 'x') and hasattr(dataset, 'data'):
-                    wavelengths = dataset.x.data if hasattr(dataset.x, 'data') else dataset.x
-                    intensities = dataset.data.squeeze() if hasattr(dataset.data, 'squeeze') else dataset.data
-                    
-                    # Convert to numpy arrays
-                    wavelengths = np.array(wavelengths)
-                    intensities = np.array(intensities)
-                    
-                    # Handle multi-dimensional data by taking first spectrum
-                    if intensities.ndim > 1:
-                        intensities = intensities[0] if intensities.shape[0] > 0 else intensities.flatten()
-                    
-                    metadata = {
-                        'format': 'SPC',
-                        'library': 'spectrochempy',
-                        'num_points': len(wavelengths),
-                        'wavelength_range': (float(np.min(wavelengths)), float(np.max(wavelengths))),
-                        'shape': dataset.shape if hasattr(dataset, 'shape') else (len(wavelengths),)
-                    }
-                    
-                    return SpectralData(wavelengths, intensities, metadata)
-                    
+                ds = scp.read(file_path)
+
+                # If 2D or higher, take the first spectrum along the first non-x axis
+                try:
+                    if getattr(ds, 'ndim', 1) > 1:
+                        ds = ds.isel({ds.dims[0]: 0}) if hasattr(ds, 'dims') else ds[0]
+                except Exception:
+                    pass
+
+                # Intensities as 1D numpy array
+                intensities = np.array(getattr(ds, 'values', getattr(ds, 'data', ds))).squeeze()
+
+                # X-axis handling with units
+                x = getattr(ds, 'x', None)
+                if x is None:
+                    # Try generic coordinate accessors
+                    x = getattr(ds, 'coords', {}).get('x', None) if hasattr(ds, 'coords') else None
+                if x is None:
+                    raise ValueError('No x-axis found in SPC dataset')
+
+                # Convert to wavelength (nm) when possible using SpectroChemPy unit engine
+                try:
+                    units = str(getattr(x, 'units', getattr(x, 'unit', '')))
+                    # Prefer built-in conversion if available
+                    if hasattr(x, 'to'):
+                        if 'cm' in units and '-' in units:
+                            wl = np.array(x.to('nm').values)
+                        else:
+                            # If already wavelength-like, try ensure nm
+                            wl = np.array(x.to('nm').values) if 'm' in units else np.array(getattr(x, 'values', getattr(x, 'data', x)))
+                    else:
+                        x_vals = np.array(getattr(x, 'values', getattr(x, 'data', x)))
+                        unit_lower = units.lower()
+                        if any(s in unit_lower for s in ['cm^-1', '1/cm', 'cm**-1']):
+                            wl = 1e7 / x_vals
+                        elif np.nanmax(x_vals) < 50:
+                            wl = x_vals * 1000.0
+                        else:
+                            wl = x_vals
+                except Exception:
+                    # Fallback: raw values
+                    wl = np.array(getattr(x, 'values', getattr(x, 'data', x)))
+
+                # Make sure 1D and aligned
+                wl = np.ravel(wl)
+                intensities = np.ravel(intensities)
+
+                # Sort ascending by wavelength
+                if wl.size > 1 and wl[0] > wl[-1]:
+                    order = slice(None, None, -1)
+                    wl = wl[order]
+                    intensities = intensities[order]
+
+                # Clean NaNs/Infs and match lengths
+                n = min(wl.size, intensities.size)
+                wl = wl[:n].astype(float)
+                intensities = intensities[:n].astype(float)
+                mask = np.isfinite(wl) & np.isfinite(intensities)
+                wl = wl[mask]
+                intensities = intensities[mask]
+
+                metadata = {
+                    'format': 'SPC',
+                    'library': 'spectrochempy',
+                    'num_points': int(wl.size),
+                    'wavelength_range_nm': (float(np.min(wl)) if wl.size else None, float(np.max(wl)) if wl.size else None),
+                    'shape': tuple(getattr(ds, 'shape', (n,)))
+                }
+                return SpectralData(wl, intensities, metadata)
             except Exception as e:
-                print(f"Spectrochempy failed: {e}, falling back to galvani or manual parsing")
-        
-        # Try galvani if spectrochempy failed
-        if GALVANI_AVAILABLE:
-            try:
-                # Galvani is primarily for electrochemical data but may handle some SPC files
-                from galvani import BioLogic
-                # This is a fallback - galvani may not support SPC format directly
-                pass
-            except Exception:
-                pass
-        
+                print(f"SpectroChempy read failed: {e}; falling back to manual parser")
+
         # Fall back to manual parsing (original implementation)
         import struct
         
@@ -313,8 +346,11 @@ class SpectralFileReader:
                 # Clean up any invalid values
                 intensities = np.where(np.isfinite(intensities), intensities, 0)
                 
-                # Ensure reasonable reflectance range (0-1)
-                intensities = np.clip(intensities, 0, 1)
+                # Preserve physical scaling (reflectance may exceed 1 slightly); just ensure finiteness
+                intensities = np.where(np.isfinite(intensities), intensities, np.nan)
+                # Optionally, shift if all values <= 0 (degenerate case)
+                if np.nanmax(intensities) <= 0:
+                    intensities = intensities - np.nanmin(intensities) + 1e-9
                 
                 # Ensure we have the right number of points
                 if len(intensities) > fnpts:

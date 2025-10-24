@@ -7,7 +7,7 @@ A Streamlit-based web application for near-infrared spectral data analysis.
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
-import pandas as pd
+from plotly.subplots import make_subplots
 import numpy as np
 from pathlib import Path
 import sys
@@ -19,6 +19,7 @@ from file_readers import SpectralFileReader, SpectralData
 from spectral_processing import SpectralProcessor
 
 
+import pandas as pd
 def main():
     st.set_page_config(
         page_title="NIR Spectra Analyzer",
@@ -263,101 +264,429 @@ def main():
         
         with tab2:
             st.header("Spectral Preprocessing")
+            st.markdown("*Apply preprocessing to multiple spectra for baseline correction, smoothing, derivatives, and normalization*")
             
-            col1, col2 = st.columns([1, 2])
+            if len(spectral_datasets) == 0:
+                st.warning("No spectral data loaded. Please upload files in the Spectrum View tab first.")
+                return
             
-            with col1:
-                st.subheader("Processing Options")
+            col_left, col_right = st.columns([1, 2])
+            
+            with col_left:
+                st.subheader("📊 Sample Selection")
                 
-                # File selection for preprocessing
-                selected_file_for_processing = st.selectbox(
-                    "Select file to process",
+                # Multiple file selection
+                selected_files_processing = st.multiselect(
+                    "Select files to process",
                     options=[dataset['name'] for dataset in spectral_datasets],
-                    help="Choose which spectrum to apply preprocessing to"
+                    default=[dataset['name'] for dataset in spectral_datasets][:3],  # Default first 3
+                    help="Select multiple files for batch processing"
                 )
                 
-                # Get the selected dataset
-                selected_dataset = next(d for d in spectral_datasets if d['name'] == selected_file_for_processing)
-                spectral_data = selected_dataset['data']
+                if not selected_files_processing:
+                    st.warning("Please select at least one file to process.")
+                    return
                 
-                # Derivative options
+                # Get wavelength ranges for all selected files
+                selected_datasets = [d for d in spectral_datasets if d['name'] in selected_files_processing]
+                all_wl_min = min(ds['data'].wavelengths.min() for ds in selected_datasets)
+                all_wl_max = max(ds['data'].wavelengths.max() for ds in selected_datasets)
+                
+                # --- WAVELENGTH RANGE SELECTION ---
+                st.subheader("📏 Wavelength Range")
+                
+                # Initialize session state for preprocessing wavelength range if not exists
+                if 'preproc_wl_min' not in st.session_state:
+                    st.session_state.preproc_wl_min = float(all_wl_min)
+                if 'preproc_wl_max' not in st.session_state:
+                    st.session_state.preproc_wl_max = float(all_wl_max)
+                
+                # Manual wavelength inputs
+                manual_col1, manual_col2 = st.columns(2)
+                with manual_col1:
+                    manual_wl_min = st.number_input(
+                        "Min (nm)",
+                        min_value=float(all_wl_min),
+                        max_value=float(all_wl_max),
+                        value=st.session_state.preproc_wl_min,
+                        step=1.0,
+                        key="preproc_manual_min"
+                    )
+                with manual_col2:
+                    manual_wl_max = st.number_input(
+                        "Max (nm)", 
+                        min_value=float(all_wl_min),
+                        max_value=float(all_wl_max),
+                        value=st.session_state.preproc_wl_max,
+                        step=1.0,
+                        key="preproc_manual_max"
+                    )
+                
+                # Quick preset buttons
+                preset_col1, preset_col2 = st.columns(2)
+                with preset_col1:
+                    if st.button("NIR (780-2500)", key="preproc_nir_btn"):
+                        st.session_state.preproc_wl_min = 780.0
+                        st.session_state.preproc_wl_max = 2500.0
+                        st.rerun()
+                with preset_col2:
+                    if st.button("Full Range", key="preproc_full_btn"):
+                        st.session_state.preproc_wl_min = float(all_wl_min)
+                        st.session_state.preproc_wl_max = float(all_wl_max)
+                        st.rerun()
+                
+                # Update session state
+                st.session_state.preproc_wl_min = manual_wl_min
+                st.session_state.preproc_wl_max = manual_wl_max
+                wavelength_range = (manual_wl_min, manual_wl_max)
+                
+                st.divider()
+                
+                # --- BASELINE CORRECTION ---
+                st.subheader("📈 Baseline Correction")
+                baseline_correction = st.selectbox(
+                    "Method",
+                    options=["None", "AsLS", "Polynomial", "Rolling Ball"],
+                    help="AsLS = Asymmetric Least Squares (recommended for NIR)"
+                )
+                
+                baseline_params = {}
+                if baseline_correction == "AsLS":
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        lam = st.selectbox("Smoothness", [1e4, 1e5, 1e6, 1e7], index=2, help="Higher = smoother baseline")
+                    with col2:
+                        p = st.selectbox("Asymmetry", [0.001, 0.01, 0.1], index=0, help="Lower = follows peaks less")
+                    baseline_params = {'lam': float(lam), 'p': float(p)}
+                elif baseline_correction == "Polynomial":
+                    degree = st.slider("Polynomial Degree", 1, 5, 2)
+                    baseline_params = {'degree': degree}
+                elif baseline_correction == "Rolling Ball":
+                    window_size = st.slider("Window Size", 10, 200, 100, step=10)
+                    baseline_params = {'window_size': window_size}
+                
+                st.divider()
+                
+                # --- SMOOTHING ---
+                st.subheader("🌊 Smoothing")
+                apply_smoothing = st.checkbox("Apply Smoothing")
+                smooth_method = "savgol"
+                smooth_window = 5
+                smooth_polyorder = 2
+                
+                if apply_smoothing:
+                    smooth_method = st.selectbox(
+                        "Method",
+                        ["savgol", "moving_average", "gaussian"],
+                        help="Savitzky-Golay recommended for spectral data"
+                    )
+                    
+                    if smooth_method == "savgol":
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            smooth_window = st.slider("Window Size", 3, 21, 5, step=2, help="Must be odd")
+                        with col2:
+                            smooth_polyorder = st.slider("Polynomial Order", 1, 5, 2, help="Usually 2 or 3")
+                    else:
+                        smooth_window = st.slider("Window Size", 3, 21, 5, step=2)
+                
+                st.divider()
+                
+                # --- DERIVATIVES ---
+                st.subheader("📊 Derivatives")
                 derivative_order = st.selectbox(
-                    "Derivative Order",
+                    "Order",
                     options=[0, 1, 2],
                     index=0,
-                    help="0 = No derivative, 1 = First derivative, 2 = Second derivative"
+                    format_func=lambda x: f"{x} (None)" if x == 0 else f"{x} ({'First' if x == 1 else 'Second'} derivative)",
+                    help="2nd derivative enhances peaks, reduces baseline effects"
                 )
                 
-                # Smoothing options
-                apply_smoothing = st.checkbox("Apply Smoothing")
-                if apply_smoothing:
-                    window_size = st.slider("Smoothing Window", 3, 21, 5, step=2)
+                st.divider()
                 
-                # Normalization options
+                # --- NORMALIZATION ---
+                st.subheader("⚖️ Normalization")
                 normalization = st.selectbox(
-                    "Normalization",
+                    "Method",
                     options=["None", "Min-Max", "Standard", "SNV"],
-                    help="SNV = Standard Normal Variate"
+                    help="SNV = Standard Normal Variate (recommended for NIR)"
                 )
+                
+                st.divider()
+                
+                # --- PROCESSING BUTTONS ---
+                st.subheader("🔄 Processing")
+                
+                # Create processing summary
+                processing_steps = []
+                if wavelength_range[0] != all_wl_min or wavelength_range[1] != all_wl_max:
+                    processing_steps.append(f"Wavelength: {wavelength_range[0]:.0f}-{wavelength_range[1]:.0f} nm")
+                if baseline_correction != "None":
+                    processing_steps.append(f"Baseline: {baseline_correction}")
+                if apply_smoothing:
+                    processing_steps.append(f"Smooth: {smooth_method} (w={smooth_window})")
+                if derivative_order > 0:
+                    processing_steps.append(f"Derivative: {derivative_order}")
+                if normalization != "None":
+                    processing_steps.append(f"Normalize: {normalization}")
+                
+                if processing_steps:
+                    st.info("**Steps to apply:**\n" + "\n".join([f"• {step}" for step in processing_steps]))
+                else:
+                    st.warning("No processing steps selected.")
                 
                 # Processing buttons
                 col_btn1, col_btn2 = st.columns(2)
                 with col_btn1:
-                    if st.button("🔄 Apply Processing"):
-                        try:
-                            processed_data = SpectralProcessor.process_spectrum(
-                                spectral_data,
-                                derivative_order=derivative_order,
-                                smooth=apply_smoothing,
-                                smooth_window=window_size if apply_smoothing else None,
-                                normalize=normalization.lower() if normalization != "None" else None
-                            )
-                            st.session_state.processed_data = processed_data
-                            st.success("✅ Processing applied!")
-                        except Exception as e:
-                            st.error(f"❌ Processing error: {str(e)}")
-                
+                    process_clicked = st.button(
+                        "🔄 Process Spectra",
+                        disabled=not processing_steps,
+                        help=f"Apply processing to {len(selected_files_processing)} files"
+                    )
                 with col_btn2:
-                    if st.button("🗑️ Clear Processing", help="Clear processed data"):
-                        if 'processed_data' in st.session_state:
-                            del st.session_state.processed_data
+                    if st.button("🗑️ Clear Results"):
+                        if 'processed_batch_data' in st.session_state:
+                            del st.session_state.processed_batch_data
                             st.success("Processed data cleared!")
                             st.rerun()
+                
+                # Apply processing if button clicked
+                if process_clicked:
+                    try:
+                        # Prepare processing parameters
+                        process_params = {
+                            'wavelength_range': wavelength_range,
+                            'baseline_correction': baseline_correction.lower() if baseline_correction != "None" else None,
+                            'baseline_params': baseline_params if baseline_correction != "None" else None,
+                            'smooth': apply_smoothing,
+                            'smooth_window': smooth_window if apply_smoothing else None,
+                            'smooth_method': smooth_method if apply_smoothing else 'savgol',
+                            'smooth_polyorder': smooth_polyorder if apply_smoothing and smooth_method == 'savgol' else 2,
+                            'derivative_order': derivative_order,
+                            'normalize': normalization.lower() if normalization != "None" else None
+                        }
+                        
+                        # Process all selected files
+                        processed_results = []
+                        progress_bar = st.progress(0)
+                        
+                        for i, dataset in enumerate(selected_datasets):
+                            # Update progress
+                            progress_bar.progress((i + 1) / len(selected_datasets))
+                            
+                            # Apply processing
+                            processed_data = SpectralProcessor.process_spectrum(
+                                dataset['data'], **process_params
+                            )
+                            
+                            processed_results.append({
+                                'name': dataset['name'],
+                                'original': dataset['data'],
+                                'processed': processed_data
+                            })
+                        
+                        # Store results in session state
+                        st.session_state.processed_batch_data = processed_results
+                        st.session_state.processing_params = process_params
+                        
+                        progress_bar.empty()
+                        st.success(f"✅ Successfully processed {len(processed_results)} spectra!")
+                        
+                    except Exception as e:
+                        st.error(f"❌ Processing error: {str(e)}")
+                        import traceback
+                        st.error(traceback.format_exc())
             
-            with col2:
-                if 'processed_data' in st.session_state:
-                    processed_data = st.session_state.processed_data
+            # --- RIGHT COLUMN: VISUALIZATION ---
+            with col_right:
+                if 'processed_batch_data' in st.session_state:
+                    processed_results = st.session_state.processed_batch_data
+                    processing_params = st.session_state.get('processing_params', {})
                     
-                    # Plot comparison
-                    fig = go.Figure()
+                    st.subheader(f"🔍 Results ({len(processed_results)} spectra)")
                     
-                    # Original spectrum
-                    fig.add_trace(go.Scatter(
-                        x=spectral_data.wavelengths,
-                        y=spectral_data.intensities,
-                        mode='lines',
-                        name='Original',
-                        line=dict(color='blue', width=2)
-                    ))
+                    # Visualization options
+                    viz_col1, viz_col2 = st.columns(2)
+                    with viz_col1:
+                        show_original = st.checkbox("Show Original", value=True)
+                    with viz_col2:
+                        show_processed = st.checkbox("Show Processed", value=True)
                     
-                    # Processed spectrum
-                    fig.add_trace(go.Scatter(
-                        x=processed_data.wavelengths,
-                        y=processed_data.intensities,
-                        mode='lines',
-                        name='Processed',
-                        line=dict(color='red', width=2)
-                    ))
-                    
-                    fig.update_layout(
-                        title="Original vs Processed Spectrum",
-                        xaxis_title="Wavelength (nm)",
-                        yaxis_title="Intensity",
-                        height=500,
-                        showlegend=True
+                    # Select which files to display
+                    files_to_show = st.multiselect(
+                        "Files to display",
+                        options=[result['name'] for result in processed_results],
+                        default=[result['name'] for result in processed_results][:5]  # Default first 5
                     )
                     
-                    st.plotly_chart(fig, use_container_width=True)
+                    if files_to_show:
+                        # Create comparison plot
+                        if processing_params.get('derivative_order', 0) > 0:
+                            # Use subplots for derivatives to handle scale differences
+                            fig = make_subplots(
+                                rows=2, cols=1,
+                                shared_xaxes=True,
+                                vertical_spacing=0.08,
+                                subplot_titles=(
+                                    "Original Spectra" if show_original else None,
+                                    f"Processed Spectra (Derivative {processing_params['derivative_order']})" if show_processed else None
+                                )
+                            )
+                            
+                            colors = px.colors.qualitative.Plotly
+                            
+                            for i, result in enumerate(processed_results):
+                                if result['name'] in files_to_show:
+                                    color = colors[i % len(colors)]
+                                    
+                                    if show_original:
+                                        fig.add_trace(
+                                            go.Scatter(
+                                                x=result['original'].wavelengths,
+                                                y=result['original'].intensities,
+                                                mode='lines',
+                                                name=f"{result['name']} (Orig)",
+                                                line=dict(color=color, width=2),
+                                                legendgroup=result['name']
+                                            ), row=1, col=1
+                                        )
+                                    
+                                    if show_processed:
+                                        fig.add_trace(
+                                            go.Scatter(
+                                                x=result['processed'].wavelengths,
+                                                y=result['processed'].intensities,
+                                                mode='lines',
+                                                name=f"{result['name']} (Proc)",
+                                                line=dict(color=color, width=2, dash='dash'),
+                                                legendgroup=result['name']
+                                            ), row=2, col=1
+                                        )
+                            
+                            fig.update_yaxes(title_text="Intensity", row=1, col=1)
+                            fig.update_yaxes(title_text="Processed Intensity", row=2, col=1)
+                            fig.update_xaxes(title_text="Wavelength (nm)", row=2, col=1)
+                            fig.update_layout(height=700, showlegend=True)
+                            
+                        else:
+                            # Single plot for non-derivative processing
+                            fig = go.Figure()
+                            colors = px.colors.qualitative.Plotly
+                            
+                            for i, result in enumerate(processed_results):
+                                if result['name'] in files_to_show:
+                                    color = colors[i % len(colors)]
+                                    
+                                    if show_original:
+                                        fig.add_trace(
+                                            go.Scatter(
+                                                x=result['original'].wavelengths,
+                                                y=result['original'].intensities,
+                                                mode='lines',
+                                                name=f"{result['name']} (Original)",
+                                                line=dict(color=color, width=2),
+                                                opacity=0.7
+                                            )
+                                        )
+                                    
+                                    if show_processed:
+                                        fig.add_trace(
+                                            go.Scatter(
+                                                x=result['processed'].wavelengths,
+                                                y=result['processed'].intensities,
+                                                mode='lines',
+                                                name=f"{result['name']} (Processed)",
+                                                line=dict(color=color, width=2, dash='dash')
+                                            )
+                                        )
+                            
+                            fig.update_layout(
+                                title=f"Spectral Preprocessing Comparison",
+                                xaxis_title="Wavelength (nm)",
+                                yaxis_title="Intensity",
+                                height=600,
+                                showlegend=True,
+                                legend=dict(yanchor="top", y=0.99, xanchor="left", x=1.01)
+                            )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Processing summary
+                        st.subheader("📝 Processing Summary")
+                        summary_text = []
+                        if processing_params.get('wavelength_range'):
+                            wl_range = processing_params['wavelength_range']
+                            summary_text.append(f"• **Wavelength Range**: {wl_range[0]:.0f} - {wl_range[1]:.0f} nm")
+                        
+                        if processing_params.get('baseline_correction'):
+                            method = processing_params['baseline_correction'].upper()
+                            params = processing_params.get('baseline_params', {})
+                            param_str = ", ".join([f"{k}={v}" for k, v in params.items()])
+                            summary_text.append(f"• **Baseline Correction**: {method} ({param_str})")
+                        
+                        if processing_params.get('smooth'):
+                            method = processing_params.get('smooth_method', 'savgol')
+                            window = processing_params.get('smooth_window', 5)
+                            if method == 'savgol':
+                                poly = processing_params.get('smooth_polyorder', 2)
+                                summary_text.append(f"• **Smoothing**: {method.upper()} (window={window}, poly={poly})")
+                            else:
+                                summary_text.append(f"• **Smoothing**: {method.upper()} (window={window})")
+                        
+                        if processing_params.get('derivative_order', 0) > 0:
+                            order = processing_params['derivative_order']
+                            summary_text.append(f"• **Derivative**: {order}{'st' if order == 1 else 'nd'} order")
+                        
+                        if processing_params.get('normalize'):
+                            method = processing_params['normalize'].upper()
+                            summary_text.append(f"• **Normalization**: {method}")
+                        
+                        st.markdown("\n".join(summary_text))
+                        
+                        # Export functionality
+                        st.subheader("💾 Export")
+                        if st.button("💾 Export Processed Data"):
+                            try:
+                                import io
+                                
+                                # Create a combined DataFrame with all processed spectra
+                                export_data = {}
+                                
+                                # Add wavelengths (assuming all have same wavelength grid after processing)
+                                first_result = processed_results[0]['processed']
+                                export_data['Wavelength_nm'] = first_result.wavelengths
+                                
+                                # Add processed intensities for each file
+                                for result in processed_results:
+                                    if result['name'] in files_to_show:
+                                        export_data[f"{result['name']}_processed"] = result['processed'].intensities
+                                        export_data[f"{result['name']}_original"] = result['original'].intensities
+                                
+                                df = pd.DataFrame(export_data)
+                                
+                                # Create CSV download
+                                csv_buffer = io.StringIO()
+                                df.to_csv(csv_buffer, index=False)
+                                csv_data = csv_buffer.getvalue()
+                                
+                                st.download_button(
+                                    label="💾 Download as CSV",
+                                    data=csv_data,
+                                    file_name="processed_spectra.csv",
+                                    mime="text/csv"
+                                )
+                                
+                                st.success("✅ Export ready! Click the download button above.")
+                                
+                            except Exception as e:
+                                st.error(f"Export error: {str(e)}")
+                    
+                    else:
+                        st.info("Select files to display in the visualization.")
+                
+                else:
+                    st.info("👈 Configure processing parameters and click 'Process Spectra' to see results here.")
+            
         
         with tab3:
             st.header("Advanced Analysis")
